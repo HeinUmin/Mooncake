@@ -27,6 +27,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "replica_selection.h"
 
 namespace mooncake {
 
@@ -688,6 +689,7 @@ class Client {
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
     void ReportLocalNicLoadStats();
+    void RefreshRemoteNicLoadCache();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -936,6 +938,13 @@ class Client {
     // Frequency admission: only cache keys whose CMS count >= threshold
     std::unique_ptr<CountMinSketch> admission_sketch_;
     uint8_t admission_threshold_ = 2;
+
+    // Remote NIC load cache for replica scoring.
+    static constexpr size_t kMaxTrackedEndpoints = 1024;
+    mutable std::mutex nic_load_scorer_mutex_;
+    std::unordered_map<std::string, std::vector<NicLoadStat>>
+        remote_nic_load_cache_;
+    std::unordered_set<std::string> known_remote_endpoints_;
 };
 
 }  // namespace mooncake

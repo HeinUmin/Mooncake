@@ -305,6 +305,11 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    // Only clear the scorer registered in Create()
+    if (ReplicaScoringEnvEnabled()) {
+        SetRemoteReplicaScorer(nullptr);
+    }
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -914,6 +919,36 @@ void Client::ReportLocalNicLoadStats() {
     }
 }
 
+void Client::RefreshRemoteNicLoadCache() {
+    // Snapshot the set of remote endpoints we have observed so far.
+    std::vector<std::string> endpoints;
+    {
+        std::lock_guard<std::mutex> lock(nic_load_scorer_mutex_);
+        endpoints.assign(known_remote_endpoints_.begin(),
+                         known_remote_endpoints_.end());
+    }
+    if (endpoints.empty()) return;  // cold-start: nothing to query yet
+
+    auto result = master_client_.BatchGetNicLoadStatsByEndpoints(endpoints);
+    if (!result) {
+        VLOG(1) << "Failed to refresh remote NIC load cache: "
+                << result.error();
+        return;
+    }
+
+    // Merge fresh data into the cache, preserving entries for endpoints
+    // that the master did not return (e.g. cold-start or momentary gap).
+    {
+        std::lock_guard<std::mutex> lock(nic_load_scorer_mutex_);
+        for (const auto& client_stats : result.value()) {
+            if (!client_stats.endpoint.empty()) {
+                remote_nic_load_cache_[client_stats.endpoint] =
+                    client_stats.devices;
+            }
+        }
+    }
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
@@ -1007,6 +1042,26 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize local hot cache";
+    }
+
+    // Injecting a scorer activates remote-replica scoring (see
+    // replica_selection.h), so keep this behind the opt-in env.
+    if (ReplicaScoringEnvEnabled()) {
+        SetRemoteReplicaScorer([weak_client = std::weak_ptr<Client>(client)](
+                                   const Replica::Descriptor& r) {
+            auto client_ptr = weak_client.lock();
+            if (client_ptr && r.is_memory_replica()) {
+                const auto& ep = r.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+                std::lock_guard<std::mutex> lock(
+                    client_ptr->nic_load_scorer_mutex_);
+                if (client_ptr->known_remote_endpoints_.size() <
+                    Client::kMaxTrackedEndpoints) {
+                    client_ptr->known_remote_endpoints_.insert(ep);
+                }
+            }
+            return BuiltinRemoteReplicaScore(r);
+        });
     }
 
     return client;
@@ -3893,6 +3948,7 @@ void Client::StorageHeartbeatThreadMain() {
             }
 
             ReportLocalNicLoadStats();
+            RefreshRemoteNicLoadCache();
 
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));

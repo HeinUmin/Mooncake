@@ -78,15 +78,23 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
     return 2.0;  // unknown protocol — least preferred, but still usable
 }
 
-// Whether remote-replica scoring is active. Opt-in via env; always on if a
-// scorer has been injected. Env is read once; the injected-scorer check is
-// live so tests / late injection take effect.
-inline bool RemoteReplicaScoringEnabled() {
+// Whether the operator opted into remote-replica scoring via
+// MC_STORE_REPLICA_SCORING=1. Env is read once. Deliberately ignores the
+// injected-scorer state: callers deciding whether to register/clear their
+// own scorer must key off this alone, never off "a scorer exists".
+inline bool ReplicaScoringEnvEnabled() {
     static const bool env_enabled = [] {
         const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
         return env && std::string(env) == "1";
     }();
-    if (env_enabled) return true;
+    return env_enabled;
+}
+
+// Whether remote-replica scoring is active. Opt-in via env; always on if a
+// scorer has been injected. Env is read once; the injected-scorer check is
+// live so tests / late injection take effect.
+inline bool RemoteReplicaScoringEnabled() {
+    if (ReplicaScoringEnvEnabled()) return true;
     std::shared_lock lk(detail::ScorerMutex());
     return static_cast<bool>(detail::ScorerStorage());
 }
